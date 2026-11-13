@@ -1,0 +1,1247 @@
+#!/usr/bin/env python3
+"""mtv — Markdown Terminal Viewer.
+
+Renders a Markdown file in the terminal the way GitHub renders a README:
+real images, big headings, tables, syntax-highlighted code and the usual
+README HTML (<p align="center">, <img width>, <details>).
+
+Usage: mtv [options] [file.md | directory | -]
+
+  (no argument)     open ./README.md
+  -w, --width N     maximum text width in columns (default 100)
+  -t, --tty         draw on the terminal even if stdout is redirected
+  -V, --version     print the version
+  -h, --help        this help
+
+Environment:
+  MTV_WIDTH         same as --width
+  MTV_GRAPHICS      kitty | iterm | sixels | none (default: auto-detected)
+  MTV_FG, MTV_BG    #rrggbb, for terminals that don't answer the colour query
+
+Images are drawn with chafa, big headings with ImageMagick, SVG with
+rsvg-convert and code with bat. All four are optional; without them mtv
+degrades to plain styled text. Python standard library only.
+"""
+__version__ = '0.1.0'
+
+import fcntl
+import hashlib
+import html
+import os
+import re
+import select
+import shutil
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+import unicodedata
+import urllib.request
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
+
+CACHE = os.path.expanduser('~/.cache/mtv')
+GH_WIDTH = 880          # ancho en px de la columna de contenido de GitHub
+MARGIN = 2
+RESET = '\033[0m'
+
+CHAFA = shutil.which('chafa')
+MAGICK = shutil.which('magick')
+RSVG = shutil.which('rsvg-convert')
+BAT = shutil.which('bat')
+HEADING_FONTS = [
+    '/Library/Fonts/SF-Pro-Display-Bold.otf',
+    '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+    '/System/Library/Fonts/Helvetica.ttc',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+]
+
+
+class Ctx:
+    tty = False
+    cols, rows = 80, 24
+    cw, ch = 16, 34         # tamaño de celda en px
+    width = 80
+    gfx = None              # protocolo gráfico para chafa
+    images = False          # si se dibujan imágenes (con protocolo o con caracteres)
+    fg = bg = None          # (r, g, b)
+    code_bg = '48;5;236'
+    code_fg = '38;5;236'
+    inline_bg = '48;5;238'
+    basedir = '.'
+    refs = {}
+    font = None
+    depth = 0
+
+
+C = Ctx()
+
+# ───────────────────────────── terminal ─────────────────────────────
+
+
+def term_geometry():
+    for fd in (1, 2, 0):
+        try:
+            r, c, xp, yp = struct.unpack('HHHH', fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\0' * 8))
+        except OSError:
+            continue
+        if c:
+            C.cols, C.rows = c, r
+            if xp and yp:
+                C.cw, C.ch = max(1, round(xp / c)), max(1, round(yp / r))
+            return
+
+
+def parse_hex(s):
+    s = (s or '').strip().lstrip('#')
+    if len(s) == 6:
+        try:
+            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            pass
+    return None
+
+
+def query_colors():
+    """Pregunta a la terminal sus colores de texto y fondo (OSC 10/11)."""
+    fg, bg = parse_hex(os.environ.get('MTV_FG')), parse_hex(os.environ.get('MTV_BG'))
+    if fg and bg:
+        return fg, bg
+    try:
+        fd = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return fg, bg
+    buf = b''
+    try:
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            os.write(fd, b'\033]10;?\033\\\033]11;?\033\\\033[c')
+            end = time.time() + 0.4
+            while time.time() < end:
+                if not select.select([fd], [], [], max(0, end - time.time()))[0]:
+                    break
+                buf += os.read(fd, 1024)
+                if re.search(rb'\033\[\?[\d;]*c', buf):
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+    except (OSError, termios.error):
+        pass
+    finally:
+        os.close(fd)
+    for m in re.finditer(rb'\]1([01]);rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)', buf):
+        rgb = tuple(round(int(x, 16) / (16 ** len(x) - 1) * 255) for x in m.groups()[1:])
+        if m.group(1) == b'0':
+            fg = fg or rgb
+        else:
+            bg = bg or rgb
+    return fg, bg
+
+
+def detect_graphics():
+    env = os.environ.get('MTV_GRAPHICS')
+    if env:
+        return None if env == 'none' else env
+    if not C.tty or not CHAFA or os.environ.get('TMUX'):
+        return None
+    tp = os.environ.get('TERM_PROGRAM', '').lower()
+    term = os.environ.get('TERM', '')
+    if tp in ('ghostty', 'wezterm') or 'kitty' in term or 'ghostty' in term or os.environ.get('KITTY_WINDOW_ID'):
+        return 'kitty'
+    if tp == 'iterm.app':
+        return 'iterm'
+    return None
+
+
+def mix(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def setup(width_opt):
+    C.tty = sys.stdout.isatty()
+    term_geometry()
+    limit = width_opt or int(os.environ.get('MTV_WIDTH') or 100)
+    C.width = max(20, min(C.cols - 2 * MARGIN, limit))
+    C.gfx = detect_graphics()
+    C.images = bool(CHAFA) and os.environ.get('MTV_GRAPHICS') != 'none' and bool(C.gfx or C.tty)
+    if C.tty or os.environ.get('MTV_FG'):
+        C.fg, C.bg = query_colors()
+    if C.fg and C.bg:
+        r, g, b = mix(C.bg, C.fg, 0.07)
+        C.code_bg, C.code_fg = f'48;2;{r};{g};{b}', f'38;2;{r};{g};{b}'
+        r, g, b = mix(C.bg, C.fg, 0.14)
+        C.inline_bg = f'48;2;{r};{g};{b}'
+    C.font = next((f for f in HEADING_FONTS if os.path.exists(f)), None)
+    os.makedirs(CACHE, exist_ok=True)
+
+
+# ───────────────────────────── texto ─────────────────────────────
+
+ANSI_RE = re.compile(r'\033\[[0-9;]*m|\033\]8;;.*?\033\\')
+SGR_RE = re.compile(r'(\033\[[0-9;]*m)')
+
+
+def chw(ch):
+    if unicodedata.combining(ch) or ch in '‍️​':
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in 'WF' else 1
+
+
+def tw(s):
+    return sum(chw(c) for c in s)
+
+
+def vlen(s):
+    return tw(ANSI_RE.sub('', s))
+
+
+def split_at(t, room):
+    w = 0
+    for i, ch in enumerate(t):
+        w += chw(ch)
+        if w > room:
+            return t[:i], t[i:]
+    return t, ''
+
+
+St = namedtuple('St', 'bold italic strike code link under dim color', defaults=(False, False, False, False, None, False, False, None))
+PLAIN = St()
+
+
+def sgr(st):
+    c = []
+    if st.bold:
+        c.append('1')
+    if st.dim:
+        c.append('2')
+    if st.italic:
+        c.append('3')
+    if st.under or st.link:
+        c.append('4')
+    if st.strike:
+        c.append('9')
+    if st.link:
+        c.append('34')
+    elif st.color:
+        c.append(st.color)
+    if st.code:
+        c.append(C.inline_bg)
+    return '\033[' + ';'.join(c) + 'm' if c else ''
+
+
+def link_target(url):
+    if re.match(r'(https?:|mailto:)', url):
+        return url
+    if url.startswith('#') or not url:
+        return None
+    path = os.path.abspath(os.path.join(C.basedir, url.split('#')[0]))
+    return 'file://' + path if os.path.exists(path) else None
+
+
+def paint(segs):
+    out = []
+    for t, st in segs:
+        code = sgr(st)
+        s = code + t + RESET if code else t
+        if st.link:
+            target = link_target(st.link)
+            if target:
+                s = f'\033]8;;{target}\033\\{s}\033]8;;\033\\'
+        out.append(s)
+    return ''.join(out)
+
+
+def wrap(tokens, width):
+    """Tokens inline → lista de líneas; cada línea es una lista de (texto, estilo)."""
+    width = max(width, 4)
+    lines = [[]]
+    state = {'w': 0, 'space': None}
+    word = []
+
+    def newline():
+        lines.append([])
+        state['w'] = 0
+
+    def put_word():
+        if not word:
+            return
+        ww = sum(tw(t) for t, _ in word)
+        if lines[-1] and state['w'] + (state['space'] is not None) + ww > width:
+            newline()
+            state['space'] = None
+        if state['space'] is not None and lines[-1]:
+            lines[-1].append((' ', state['space']))
+            state['w'] += 1
+        state['space'] = None
+        for t, st in word:
+            while state['w'] + tw(t) > width:
+                head, t = split_at(t, width - state['w'])
+                if head:
+                    lines[-1].append((head, st))
+                elif not lines[-1]:
+                    head, t = t[:1], t[1:]
+                    lines[-1].append((head, st))
+                newline()
+            if t:
+                lines[-1].append((t, st))
+                state['w'] += tw(t)
+        word.clear()
+
+    for tok in tokens:
+        if tok[0] == 'br':
+            put_word()
+            state['space'] = None
+            newline()
+            continue
+        if tok[0] == 'img':
+            tok = ('t', '▣ ' + (tok[2] or 'image'), St(dim=True))
+        _, text, st = tok
+        for part in re.split(r'(\s+)', text):
+            if not part:
+                continue
+            if part.isspace():
+                put_word()
+                state['space'] = st
+            else:
+                word.append((part, st))
+    put_word()
+    while len(lines) > 1 and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def ansi_wrap(line, width):
+    """Corta una línea con códigos SGR en trozos de `width` columnas."""
+    if vlen(line) <= width:
+        return [line]
+    parts, cur, w, active = [], '', 0, ''
+    for tok in SGR_RE.split(line):
+        if not tok:
+            continue
+        if SGR_RE.fullmatch(tok):
+            active = '' if tok in ('\033[0m', '\033[m') else active + tok
+            cur += tok
+            continue
+        for ch in tok:
+            cwid = chw(ch)
+            if w + cwid > width:
+                parts.append(cur + RESET)
+                cur, w = active, 0
+            cur += ch
+            w += cwid
+    parts.append(cur)
+    return parts
+
+
+# ───────────────────────────── inline ─────────────────────────────
+
+INLINE = re.compile(r'''
+  (?P<esc>\\[!-/:-@\[-`{-~])
+ |(?P<hbr>\x00)
+ |(?P<code>(?P<cq>`+)(?!`)(?P<ctext>.+?)(?<!`)(?P=cq)(?!`))
+ |(?P<img>!\[(?P<alt>[^\]]*)\]\(\s*<?(?P<isrc>[^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\))
+ |(?P<link>\[(?P<ltext>(?:[^\[\]]|!?\[[^\]]*\](?:\([^)]*\))?)*)\]\(\s*<?(?P<lurl>[^)\s>]*)>?(?:\s+["'][^"']*["'])?\s*\))
+ |(?P<reflink>\[(?P<rtext>[^\[\]]+)\](?:\[(?P<rid>[^\]]*)\])?)
+ |(?P<auto><(?P<aurl>(?:https?://|mailto:)[^>\s]+)>)
+ |(?P<comment><!--.*?-->)
+ |(?P<htmlimg><img\b[^>]*>)
+ |(?P<br><br\s*/?>)
+ |(?P<tag></?(?P<tname>[a-zA-Z][a-zA-Z0-9]*)\b[^>]*>)
+ |(?P<url>https?://[^\s<>\x00]*[^\s<>\x00.,;:!?)\]'"*_])
+ |(?P<b3>\*\*\*(?=\S)(?P<b3text>.+?)(?<=\S)\*\*\*)
+ |(?P<bold>\*\*(?=\S)(?P<btext>.+?)(?<=\S)\*\*)
+ |(?P<ubold>(?<!\w)__(?=\S)(?P<ubtext>.+?)(?<=\S)__(?!\w))
+ |(?P<ital>\*(?![\s*])(?P<itext>[^*]+?)(?<!\s)\*)
+ |(?P<uital>(?<!\w)_(?![\s_])(?P<uitext>[^_]+?)(?<!\s)_(?!\w))
+ |(?P<strike>~~(?=\S)(?P<stext>.+?)(?<=\S)~~)
+''', re.X | re.S)
+
+ATTR_RE = re.compile(r'([a-zA-Z-]+)\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)')
+TAG_STYLE = {'b': 'bold', 'strong': 'bold', 'i': 'italic', 'em': 'italic', 'code': 'code', 'kbd': 'code',
+             'tt': 'code', 'samp': 'code', 's': 'strike', 'del': 'strike', 'strike': 'strike',
+             'u': 'under', 'ins': 'under'}
+
+
+def attrs_of(tag):
+    return {k.lower(): html.unescape(v.strip('"\'')) for k, v in ATTR_RE.findall(tag)}
+
+
+def inline(s, st=PLAIN):
+    out = []
+    s = re.sub(r'(?: {2,}|\\)\n', '\x00', s.strip())
+    s = re.sub(r'[ \t]*\n[ \t]*', ' ', s)
+    _inline(s, st, out)
+    return out
+
+
+def _inline(s, st, out):
+    pos = 0
+
+    def text(t, style):
+        if t:
+            out.append(('t', html.unescape(t), style))
+
+    while True:
+        m = INLINE.search(s, pos)
+        if not m:
+            text(s[pos:], st)
+            return
+        text(s[pos:m.start()], st)
+        pos = m.end()
+        k = m.lastgroup
+        if k == 'esc':
+            text(m.group(0)[1], st)
+        elif k == 'hbr':
+            out.append(('br',))
+        elif k == 'code':
+            t = m.group('ctext')
+            if len(t) > 2 and t[0] == ' ' and t[-1] == ' ':
+                t = t[1:-1]
+            out.append(('t', t, st._replace(code=True)))
+        elif k == 'img':
+            out.append(('img', m.group('isrc'), m.group('alt'), {}))
+        elif k == 'link':
+            _inline(m.group('ltext'), st._replace(link=m.group('lurl')), out)
+        elif k == 'reflink':
+            rid = (m.group('rid') or m.group('rtext')).lower()
+            if rid in C.refs:
+                _inline(m.group('rtext'), st._replace(link=C.refs[rid]), out)
+            else:
+                text('[', st)
+                pos = m.start() + 1
+        elif k == 'auto':
+            url = m.group('aurl')
+            text(url.replace('mailto:', ''), st._replace(link=url))
+        elif k == 'url':
+            text(m.group(0), st._replace(link=m.group(0)))
+        elif k == 'htmlimg':
+            a = attrs_of(m.group(0))
+            out.append(('img', a.get('src', ''), a.get('alt', ''), a))
+        elif k == 'br':
+            out.append(('br',))
+        elif k == 'tag':
+            name = m.group('tname').lower()
+            closing = m.group(0)[1] == '/'
+            if name in TAG_STYLE:
+                st = st._replace(**{TAG_STYLE[name]: not closing})
+            elif name == 'a':
+                st = st._replace(link=None if closing else attrs_of(m.group(0)).get('href'))
+        elif k == 'b3':
+            _inline(m.group('b3text'), st._replace(bold=True, italic=True), out)
+        elif k == 'bold':
+            _inline(m.group('btext'), st._replace(bold=True), out)
+        elif k == 'ubold':
+            _inline(m.group('ubtext'), st._replace(bold=True), out)
+        elif k == 'ital':
+            _inline(m.group('itext'), st._replace(italic=True), out)
+        elif k == 'uital':
+            _inline(m.group('uitext'), st._replace(italic=True), out)
+        elif k == 'strike':
+            _inline(m.group('stext'), st._replace(strike=True), out)
+
+
+def plain_text(tokens):
+    return re.sub(r'\s+', ' ', ''.join(t[1] if t[0] == 't' else ' ' for t in tokens if t[0] != 'img')).strip()
+
+
+# ───────────────────────────── bloques ─────────────────────────────
+
+LIST_RE = re.compile(r'^( *)([-*+]|\d{1,9}[.)])( +|$)(.*)$')
+HR_RE = re.compile(r'^ {0,3}([-*_])(\s*\1){2,}\s*$')
+FENCE_RE = re.compile(r'^( {0,3})(`{3,}|~{3,})\s*([^`]*)$')
+HEAD_RE = re.compile(r'^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?\s*$')
+QUOTE_RE = re.compile(r'^ {0,3}> ?')
+TABLE_DELIM = re.compile(r'^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$')
+HTML_BLOCK = re.compile(r'^ {0,3}<(?:/?(?:p|div|details|summary|h[1-6]|center|picture|table|ul|ol|hr)\b|!--)', re.I)
+HTML_TAGS = {'p', 'div', 'details', 'summary', 'center', 'picture', 'source', 'table', 'thead', 'tbody',
+             'tr', 'td', 'th', 'ul', 'ol', 'li', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+REF_RE = re.compile(r'^ {0,3}\[([^\]^][^\]]*)\]:\s*<?(\S+?)>?(?:\s+["\'(].*["\')])?\s*$')
+
+
+def indent_of(line):
+    return len(line) - len(line.lstrip(' '))
+
+
+def is_block_start(line):
+    return bool(HEAD_RE.match(line) or FENCE_RE.match(line) or QUOTE_RE.match(line)
+                or HR_RE.match(line) or HTML_BLOCK.match(line))
+
+
+def split_row(line):
+    line = line.strip()
+    if line.startswith('|'):
+        line = line[1:]
+    if line.endswith('|') and not line.endswith('\\|'):
+        line = line[:-1]
+    cells, cur, in_code = [], '', False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == '\\' and i + 1 < len(line) and line[i + 1] == '|':
+            cur += '|'
+            i += 2
+            continue
+        if ch == '`':
+            in_code = not in_code
+        if ch == '|' and not in_code:
+            cells.append(cur.strip())
+            cur = ''
+        else:
+            cur += ch
+        i += 1
+    cells.append(cur.strip())
+    return cells
+
+
+def html_blocks(chunk):
+    out, buf, aligns = [], [], []
+    ctx = [None]
+    pos = 0
+
+    def align():
+        return next((a for a in reversed(aligns) if a), None)
+
+    def flush():
+        text = ''.join(buf).strip()
+        buf.clear()
+        if not text:
+            return
+        if ctx[0] == 'summary':
+            out.append(('summary', text))
+        elif ctx[0]:
+            out.append(('h', ctx[0], text, align()))
+        else:
+            out.append(('p', text, align()))
+
+    for m in re.finditer(r'<!--.*?-->|<(/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>', chunk, re.S):
+        tag = (m.group(2) or '').lower()
+        comment = m.group(0).startswith('<!--')
+        if not comment and tag not in HTML_TAGS:
+            continue
+        buf.append(chunk[pos:m.start()])
+        pos = m.end()
+        if comment:
+            continue
+        closing = m.group(1) == '/'
+        flush()
+        if tag in ('p', 'div', 'center') or re.fullmatch(r'h[1-6]', tag):
+            if closing:
+                if aligns:
+                    aligns.pop()
+            else:
+                a = attrs_of(m.group(3)).get('align', '').lower()
+                aligns.append('center' if tag == 'center' or a == 'center' else None)
+        if re.fullmatch(r'h[1-6]', tag):
+            ctx[0] = None if closing else int(tag[1])
+        elif tag == 'summary':
+            ctx[0] = None if closing else 'summary'
+        elif tag == 'hr':
+            out.append(('hr',))
+        elif tag == 'li' and not closing:
+            buf.append('• ')
+    buf.append(chunk[pos:])
+    flush()
+    return out
+
+
+def parse_list(lines, i):
+    n = len(lines)
+    m = LIST_RE.match(lines[i])
+    ordered = m.group(2)[0].isdigit()
+    start = int(m.group(2)[:-1]) if ordered else 1
+    items, loose = [], False
+    while i < n:
+        m = LIST_RE.match(lines[i])
+        if not m or m.group(2)[0].isdigit() != ordered or HR_RE.match(lines[i]):
+            break
+        sp = len(m.group(3))
+        ci = len(m.group(1)) + len(m.group(2)) + (sp if 1 <= sp <= 4 else 1)
+        body = [m.group(4)]
+        i += 1
+        while i < n:
+            line = lines[i]
+            if not line.strip():
+                j = i
+                while j < n and not lines[j].strip():
+                    j += 1
+                if j < n and indent_of(lines[j]) >= ci:
+                    body.extend([''] * (j - i))
+                    i = j
+                    continue
+                break
+            if indent_of(line) >= ci:
+                body.append(line[ci:])
+            elif LIST_RE.match(line) or is_block_start(line):
+                break
+            else:
+                body.append(line.strip())
+            i += 1
+        items.append(body)
+        j = i
+        while j < n and not lines[j].strip():
+            j += 1
+        if j > i:
+            m2 = LIST_RE.match(lines[j]) if j < n else None
+            if m2 and m2.group(2)[0].isdigit() == ordered and not HR_RE.match(lines[j]) and len(m2.group(1)) < 4:
+                loose = True
+                i = j
+                continue
+            break
+    return ('list', ordered, start, items, loose), i
+
+
+def parse_blocks(lines):
+    blocks, para = [], []
+    i, n = 0, len(lines)
+
+    def flush():
+        if para:
+            blocks.append(('p', '\n'.join(para), None))
+            para.clear()
+
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            flush()
+            i += 1
+            continue
+        m = FENCE_RE.match(line)
+        if m:
+            flush()
+            ind, fence, info = len(m.group(1)), m.group(2), m.group(3).strip()
+            close = re.compile(r'^ {0,3}' + re.escape(fence[0]) + '{%d,}\\s*$' % len(fence))
+            code = []
+            i += 1
+            while i < n and not close.match(lines[i]):
+                code.append(lines[i][min(ind, indent_of(lines[i])):])
+                i += 1
+            i += 1
+            blocks.append(('code', info.split()[0] if info else '', code))
+            continue
+        if HTML_BLOCK.match(line):
+            flush()
+            chunk = []
+            if line.lstrip().startswith('<!--'):
+                while i < n:
+                    chunk.append(lines[i])
+                    i += 1
+                    if '-->' in chunk[-1]:
+                        break
+            else:
+                while i < n and lines[i].strip():
+                    chunk.append(lines[i])
+                    i += 1
+            blocks.extend(html_blocks('\n'.join(chunk)))
+            continue
+        m = HEAD_RE.match(line)
+        if m:
+            flush()
+            blocks.append(('h', len(m.group(1)), m.group(2) or '', None))
+            i += 1
+            continue
+        if para and re.match(r'^ {0,3}(=+|-+)\s*$', line):
+            text = '\n'.join(para)
+            para.clear()
+            blocks.append(('h', 1 if line.strip()[0] == '=' else 2, text, None))
+            i += 1
+            continue
+        if HR_RE.match(line):
+            flush()
+            blocks.append(('hr',))
+            i += 1
+            continue
+        if QUOTE_RE.match(line):
+            flush()
+            q = []
+            while i < n and lines[i].strip() and (QUOTE_RE.match(lines[i]) or (q and q[-1].strip() and not is_block_start(lines[i]) and not LIST_RE.match(lines[i]))):
+                q.append(QUOTE_RE.sub('', lines[i], count=1) if QUOTE_RE.match(lines[i]) else lines[i].strip())
+                i += 1
+            blocks.append(('quote', q))
+            continue
+        m = LIST_RE.match(line)
+        if m and len(m.group(1)) < 4 and (not para or (m.group(4) and (not m.group(2)[0].isdigit() or m.group(2)[:-1] == '1'))):
+            flush()
+            block, i = parse_list(lines, i)
+            blocks.append(block)
+            continue
+        if '|' in line and i + 1 < n and '-' in lines[i + 1] and TABLE_DELIM.match(lines[i + 1]):
+            head, delim = split_row(line), split_row(lines[i + 1])
+            if len(head) == len(delim):
+                flush()
+                aligns = ['center' if d.startswith(':') and d.endswith(':') else 'right' if d.endswith(':') else 'left' for d in delim]
+                rows = []
+                i += 2
+                while i < n and lines[i].strip() and '|' in lines[i] and not is_block_start(lines[i]):
+                    r = split_row(lines[i])
+                    rows.append((r + [''] * len(head))[:len(head)])
+                    i += 1
+                blocks.append(('table', head, aligns, rows))
+                continue
+        if not para and indent_of(line) >= 4:
+            code = []
+            while i < n and (indent_of(lines[i]) >= 4 or not lines[i].strip()):
+                code.append(lines[i][4:])
+                i += 1
+            while code and not code[-1].strip():
+                code.pop()
+            blocks.append(('code', '', code))
+            continue
+        para.append(line.lstrip())
+        i += 1
+    flush()
+    return blocks
+
+
+# ───────────────────────────── imágenes ─────────────────────────────
+
+
+def sha(*parts):
+    return hashlib.sha1('\0'.join(str(p) for p in parts).encode()).hexdigest()[:20]
+
+
+def image_size(path):
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    if head[:8] == b'\x89PNG\r\n\x1a\n':
+        return struct.unpack('>II', head[16:24])
+    if head[:6] in (b'GIF87a', b'GIF89a'):
+        return struct.unpack('<HH', head[6:10])
+    if is_svg(path, head):
+        return svg_size(path)
+    try:
+        out = subprocess.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path],
+                             capture_output=True, text=True, timeout=10).stdout
+        w, h = re.search(r'pixelWidth: (\d+)', out), re.search(r'pixelHeight: (\d+)', out)
+        if w and h:
+            return int(w.group(1)), int(h.group(1))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if MAGICK:
+        try:
+            out = subprocess.run([MAGICK, 'identify', '-format', '%w %h\n', path + '[0]'],
+                                 capture_output=True, text=True, timeout=10).stdout.split()
+            return int(out[0]), int(out[1])
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
+    return None
+
+
+def is_svg(path, head=None):
+    if path.lower().split('?')[0].endswith('.svg'):
+        return True
+    if head is None:
+        try:
+            with open(path, 'rb') as f:
+                head = f.read(2048)
+        except OSError:
+            return False
+    return b'<svg' in head[:2048]
+
+
+def svg_size(path):
+    try:
+        with open(path, 'r', errors='replace') as f:
+            m = re.search(r'<svg\b[^>]*>', f.read(65536), re.S)
+    except OSError:
+        return None
+    a = attrs_of(m.group(0)) if m else {}
+
+    def num(v):
+        mm = re.fullmatch(r'\s*([\d.]+)\s*(px)?\s*', v or '')
+        return float(mm.group(1)) if mm else None
+
+    w, h = num(a.get('width')), num(a.get('height'))
+    vb = [float(x) for x in re.findall(r'-?[\d.]+', a.get('viewbox', ''))]
+    if w and h:
+        return w, h
+    if len(vb) == 4 and vb[2] and vb[3]:
+        if w:
+            return w, w * vb[3] / vb[2]
+        if h:
+            return h * vb[2] / vb[3], h
+        return vb[2], vb[3]
+    return 300, 150
+
+
+def fetch(url):
+    path = os.path.join(CACHE, 'dl-' + sha(url))
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400:
+        return path
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'mtv/' + __version__})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = r.read(30 * 1024 * 1024)
+        with open(path + '.tmp', 'wb') as f:
+            f.write(data)
+        os.replace(path + '.tmp', path)
+        return path
+    except Exception:
+        return path if os.path.exists(path) else None
+
+
+class Img:
+    """Una imagen (o un título renderizado como imagen) lista para colocar en celdas."""
+
+    def __init__(self, src='', alt='', attrs=None, avail=0, heading=None):
+        self.src, self.alt, self.attrs = src, alt, attrs or {}
+        self.avail = avail
+        self.heading = heading      # (nivel, texto) si es un título
+        self.ok = False
+        self.path = None
+        self.cols = self.rows = 0
+
+    def prepare(self):
+        try:
+            self.ok = bool(self._heading() if self.heading else self._image())
+        except Exception:
+            self.ok = False
+
+    def _image(self):
+        src = self.src.strip()
+        if re.match(r'https?://', src):
+            path = fetch(src)
+        else:
+            rel = re.split(r'[?#]', src)[0]
+            path = os.path.join(C.basedir, rel.lstrip('/') if rel.startswith('/') else rel)
+        if not path or not os.path.isfile(path):
+            return False
+        size = image_size(path)
+        if not size or not size[0] or not size[1]:
+            return False
+        pw, ph = size
+        wa, ha = self.attrs.get('width', ''), self.attrs.get('height', '')
+        m = re.fullmatch(r'\s*([\d.]+)\s*(%|px)?\s*', wa)
+        mh = re.fullmatch(r'\s*([\d.]+)\s*(px)?\s*', ha)
+        if m and m.group(2) == '%':
+            cols = self.avail * float(m.group(1)) / 100
+        elif m:
+            cols = float(m.group(1)) / GH_WIDTH * C.width
+        elif mh:
+            cols = float(mh.group(1)) * pw / ph / GH_WIDTH * C.width
+        else:
+            cols = pw / GH_WIDTH * C.width
+        cols = max(1, min(self.avail, round(cols)))
+        rows = max(1, round(cols * C.cw * ph / pw / C.ch))
+        max_rows = max(4, C.rows - 3)
+        if rows > max_rows:
+            rows = max_rows
+            cols = max(1, min(self.avail, round(rows * C.ch * pw / ph / C.cw)))
+        self.cols, self.rows = cols, rows
+        if is_svg(path) and RSVG:
+            px = max(cols * C.cw, round(rows * C.ch * pw / ph))
+            out = os.path.join(CACHE, f'svg-{sha(path, os.path.getmtime(path), px)}.png')
+            if not os.path.exists(out):
+                r = subprocess.run([RSVG, '-w', str(px), '-a', '-o', out, path], capture_output=True, timeout=20)
+                if r.returncode != 0:
+                    return False
+            path = out
+        self.path = path
+        return True
+
+    def _heading(self):
+        level, text = self.heading
+        px = round(C.ch * (1.6 if level == 1 else 1.25))
+        maxw = self.avail * C.cw
+        fg = '#%02x%02x%02x' % C.fg
+        out = os.path.join(CACHE, f'h-{sha(text, px, fg, C.font, maxw, C.cw, C.ch)}.png')
+        if not os.path.exists(out):
+            safe = text.replace('\\', '\\\\').replace('%', '%%')
+            if safe.startswith('@'):
+                safe = '\\' + safe
+            base = [MAGICK, '-background', 'none', '-fill', fg] + (['-font', C.font] if C.font else []) + ['-pointsize', str(px)]
+            ext = ['-gravity', 'West', '-extent',
+                   f'%[fx:ceil(w/{C.cw})*{C.cw}]x%[fx:max(2,ceil(h/{C.ch}))*{C.ch}]', 'PNG32:' + out]
+            subprocess.run(base + ['label:' + safe] + ext, capture_output=True, timeout=20, check=True)
+            if image_size(out)[0] > maxw:
+                subprocess.run(base + ['-size', f'{maxw}x', 'caption:' + safe] + ext,
+                               capture_output=True, timeout=20, check=True)
+        w, h = image_size(out)
+        self.path = out
+        self.cols, self.rows = max(1, round(w / C.cw)), max(1, round(h / C.ch))
+        return True
+
+
+class Row:
+    """Fila de imágenes que se colocan una al lado de otra."""
+
+    def __init__(self, specs, align, width, fallback=None):
+        self.specs, self.align, self.width = specs, align, width
+        self.indent = 0
+        self.fallback = fallback or []      # líneas de texto si no se puede dibujar
+
+
+# ───────────────────────────── render ─────────────────────────────
+
+ALERTS = {
+    'NOTE': ('34', 'ⓘ', 'Note'), 'TIP': ('32', '💡', 'Tip'), 'IMPORTANT': ('35', '✱', 'Important'),
+    'WARNING': ('33', '⚠', 'Warning'), 'CAUTION': ('31', '⛔', 'Caution'),
+}
+BULLETS = '•◦▪'
+
+
+def dim(s):
+    return f'\033[90m{s}{RESET}'
+
+
+def center(line, width):
+    return ' ' * max(0, (width - vlen(line)) // 2) + line
+
+
+def prefixed(items, first, rest):
+    out, used = [], False
+    pad = vlen(rest)
+    for it in items:
+        if isinstance(it, str):
+            out.append((rest if used else first) + it)
+            used = True
+        else:
+            it.indent += pad
+            out.append(it)
+    return out
+
+
+def render_paragraph(text, align, width, st=PLAIN):
+    tokens = inline(text, st)
+    imgs = [t for t in tokens if t[0] == 'img']
+    only_imgs = imgs and all(t[0] in ('img', 'br') or (t[0] == 't' and not t[1].strip()) for t in tokens)
+    if only_imgs:
+        specs = [Img(t[1], t[2], t[3], avail=width) for t in imgs]
+        return [Row(specs, align, width)]
+    lines = [paint(l) for l in wrap(tokens, width)]
+    if align == 'center':
+        lines = [center(l, width) for l in lines]
+    return lines
+
+
+def render_heading(level, text, align, width):
+    tokens = inline(text)
+    title = plain_text(tokens)
+    if not title:
+        imgs = [t for t in tokens if t[0] == 'img']
+        return [Row([Img(t[1], t[2], t[3], avail=width) for t in imgs], align, width)] if imgs else []
+    st = St(bold=True) if level <= 4 else St(bold=True, dim=True)
+    text_lines = [paint(l) for l in wrap(inline(text, st), width)]
+    if align == 'center':
+        text_lines = [center(l, width) for l in text_lines]
+    rule = [dim('─' * width)] if level <= 2 else []
+    if level <= 2 and C.gfx and MAGICK and C.fg:
+        return [Row([Img(avail=width, heading=(level, title))], align, width, fallback=text_lines)] + rule
+    if level == 1:
+        text_lines = [l.replace('\033[1m', '\033[1;4m') for l in text_lines]
+    return text_lines + rule
+
+
+def render_code(lang, code, width):
+    inner = max(8, width - 4)
+    lines = None
+    if lang and BAT and C.tty and lang.lower() not in ('text', 'txt', 'plain', 'mermaid'):
+        try:
+            r = subprocess.run([BAT, '-l', lang, '--color=always', '--style=plain', '--paging=never', '--wrap=never'],
+                               input='\n'.join(code), capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                lines = r.stdout.split('\n')
+                if lines and not ANSI_RE.sub('', lines[-1]).strip():
+                    lines.pop()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if lines is None:
+        lines = code
+    bg = f'\033[{C.code_bg}m'
+    out = [f'\033[{C.code_fg}m' + '▄' * width + RESET]
+    if lang.lower() == 'mermaid':
+        label = 'mermaid · diagram not rendered'
+        out.append(bg + '  ' + f'\033[90;3m{label}' + ' ' * (inner - tw(label)) + '  ' + RESET)
+        out.append(bg + ' ' * width + RESET)
+    for line in lines:
+        for part in ansi_wrap(line.replace('\t', '    '), inner):
+            body = part.replace('\033[0m', '\033[0m' + bg).replace('\033[m', '\033[m' + bg)
+            out.append(bg + '  ' + body + bg + ' ' * (inner - vlen(part)) + '  ' + RESET)
+    out.append(f'\033[{C.code_fg}m' + '▀' * width + RESET)
+    return out
+
+
+def render_quote(q, width):
+    color, title = '90', None
+    m = re.match(r'^\s*\[!(\w+)\]\s*$', q[0]) if q else None
+    if m and m.group(1).upper() in ALERTS:
+        color, icon, name = ALERTS[m.group(1).upper()]
+        title = f'\033[1;{color}m{icon} {name}{RESET}'
+        q = q[1:]
+    items = render(parse_blocks(q), width - 2)
+    if title:
+        items = [title] + items
+    bar = f'\033[{color}m▎{RESET} '
+    return prefixed(items, bar, bar)
+
+
+def render_list(ordered, start, bodies, loose, width):
+    out = []
+    nums = [f'{start + k}.' for k in range(len(bodies))]
+    mw = (max(len(x) for x in nums) + 1) if ordered else 2
+    C.depth += 1
+    for k, body in enumerate(bodies):
+        marker = (nums[k].rjust(mw - 1) + ' ') if ordered else BULLETS[min(C.depth - 1, 2)] + ' '
+        m = re.match(r'^\[([ xX])\]\s+', body[0]) if body else None
+        if m:
+            body = [body[0][m.end():]] + body[1:]
+            marker = ('☑ ' if m.group(1) != ' ' else '☐ ').rjust(mw)
+        marker = dim(marker) if ordered else marker
+        items = render(parse_blocks(body), width - mw, tight=not loose) or ['']
+        if loose and out:
+            out.append('')
+        out.extend(prefixed(items, marker, ' ' * mw))
+    C.depth -= 1
+    return out
+
+
+def render_table(head, aligns, rows, width):
+    ncol = len(head)
+    cells = [[inline(c, St(bold=True)) for c in head]] + [[inline(c) for c in r] for r in rows]
+
+    def natural(tokens):
+        return max((vlen(paint(l)) for l in wrap(tokens, 10 ** 6)), default=0)
+
+    widths = [max(3, max(natural(r[c]) for r in cells)) for c in range(ncol)]
+    budget = width - (3 * ncol + 1)
+    while sum(widths) > budget and max(widths) > 6:
+        widths[widths.index(max(widths))] -= 1
+    wrapped = [[[paint(l) for l in wrap(r[c], widths[c])] for c in range(ncol)] for r in cells]
+    multi = any(len(cell) > 1 for r in wrapped[1:] for cell in r)
+
+    def rule(l, m, r):
+        return dim(l + m.join('─' * (w + 2) for w in widths) + r)
+
+    def pad(s, w, a):
+        gap = max(0, w - vlen(s))
+        if a == 'center':
+            return ' ' * (gap // 2) + s + ' ' * (gap - gap // 2)
+        return ' ' * gap + s if a == 'right' else s + ' ' * gap
+
+    bar = dim('│')
+    out = [rule('┌', '┬', '┐')]
+    for ri, r in enumerate(wrapped):
+        for li in range(max(len(c) for c in r)):
+            out.append(bar + bar.join(' ' + pad(r[c][li] if li < len(r[c]) else '', widths[c], aligns[c]) + ' '
+                                      for c in range(ncol)) + bar)
+        if ri < len(wrapped) - 1 and (ri == 0 or multi):
+            out.append(rule('├', '┼', '┤'))
+    out.append(rule('└', '┴', '┘'))
+    return out
+
+
+def render(blocks, width, tight=False):
+    out = []
+    for b in blocks:
+        kind = b[0]
+        if kind == 'p':
+            items = render_paragraph(b[1], b[2], width)
+        elif kind == 'h':
+            items = render_heading(b[1], b[2], b[3], width)
+            if out and not tight and b[1] <= 2:
+                out.append('')
+        elif kind == 'code':
+            items = render_code(b[1], b[2], width)
+        elif kind == 'quote':
+            items = render_quote(b[1], width)
+        elif kind == 'list':
+            items = render_list(b[1], b[2], b[3], b[4], width)
+        elif kind == 'table':
+            items = render_table(b[1], b[2], b[3], width)
+        elif kind == 'summary':
+            items = [paint(l) for l in wrap([('t', '▾ ', St(dim=True))] + inline(b[1], St(bold=True)), width)]
+        elif kind == 'hr':
+            items = [dim('─' * width)]
+        else:
+            items = []
+        if not items:
+            continue
+        if out and not tight:
+            out.append('')
+        out.extend(items)
+    return out
+
+
+# ───────────────────────────── salida ─────────────────────────────
+
+
+def chafa_cmd(fmt, sp):
+    return [CHAFA, '-f', fmt, '--probe', 'off', '--animate', 'off', '--scale', 'max',
+            '-s', f'{sp.cols}x{sp.rows}', sp.path]
+
+
+class Plain:
+    """Salida sin códigos ANSI (cuando no es una terminal)."""
+
+    def __init__(self, o):
+        self.o = o
+
+    def write(self, s):
+        self.o.write(ANSI_RE.sub('', s))
+
+    def flush(self):
+        self.o.flush()
+
+
+def emit_row(row, o):
+    pad = ' ' * (MARGIN + row.indent)
+    good = [sp for sp in row.specs if sp.ok]
+    drawable = C.images
+    if not drawable or len(good) < len(row.specs):
+        if row.fallback:
+            for line in row.fallback:
+                o.write(pad + line + '\n')
+            return
+        for sp in row.specs:
+            if not (sp.ok and drawable):
+                line = dim('▣ ' + (sp.alt or os.path.basename(sp.src) or 'image'))
+                o.write(pad + (center(line, row.width) if row.align == 'center' else line) + '\n')
+        if not drawable:
+            return
+    if not C.gfx:
+        # sin protocolo gráfico: chafa con caracteres, una imagen por bloque
+        for sp in good:
+            if sp.rows < 3:
+                line = dim('▣ ' + (sp.alt or 'image'))
+                o.write(pad + (center(line, row.width) if row.align == 'center' else line) + '\n')
+                continue
+            r = subprocess.run(chafa_cmd('symbols', sp), capture_output=True, text=True)
+            off = ' ' * ((row.width - sp.cols) // 2) if row.align == 'center' else ''
+            for line in r.stdout.rstrip('\n').split('\n'):
+                o.write(pad + off + line + RESET + '\n')
+        return
+    groups, cur, w = [], [], 0
+    for sp in good:
+        need = sp.cols + (1 if cur else 0)
+        if cur and w + need > row.width:
+            groups.append(cur)
+            cur, w, need = [], 0, sp.cols
+        cur.append(sp)
+        w += need
+    if cur:
+        groups.append(cur)
+    for grp in groups:
+        total = sum(sp.cols for sp in grp) + len(grp) - 1
+        x = MARGIN + row.indent + (max(0, (row.width - total) // 2) if row.align == 'center' else 0)
+        height = max(sp.rows for sp in grp)
+        o.write('\n' * height + f'\033[{height}A\r')
+        for sp in grp:
+            dy = (height - sp.rows) // 2
+            o.write('\0337' + (f'\033[{x}C' if x else '') + (f'\033[{dy}B' if dy else ''))
+            o.flush()
+            subprocess.run(chafa_cmd(C.gfx, sp))
+            o.write('\0338')
+            x += sp.cols + 1
+        o.write(f'\033[{height}B\r')
+        o.flush()
+
+
+def emit(items):
+    o = sys.stdout if C.tty else Plain(sys.stdout)
+    rows = [it for it in items if isinstance(it, Row)]
+    specs = [sp for r in rows for sp in r.specs]
+    if specs and C.images:
+        with ThreadPoolExecutor(8) as pool:
+            list(pool.map(lambda sp: sp.prepare(), specs))
+    blank = True
+    o.write('\n')
+    for it in items:
+        if isinstance(it, str):
+            if not it and blank:
+                continue
+            blank = not it
+            line = (' ' * MARGIN + it).rstrip() if it else ''
+            o.write(line + '\n')
+        else:
+            emit_row(it, o)
+            blank = False
+    if not blank:
+        o.write('\n')
+    o.flush()
+
+
+def main():
+    args = sys.argv[1:]
+    width_opt = None
+    force_tty = False
+    rest = []
+    k = 0
+    while k < len(args):
+        a = args[k]
+        if a in ('-h', '--help'):
+            print(__doc__.strip())
+            return 0
+        if a in ('-V', '--version'):
+            print('mtv ' + __version__)
+            return 0
+        if a in ('-t', '--tty'):
+            force_tty = True
+        elif a in ('-w', '--width'):
+            k += 1
+            try:
+                width_opt = int(args[k])
+            except (IndexError, ValueError):
+                print('mtv: --width needs a number', file=sys.stderr)
+                return 2
+        elif a.startswith('-') and a != '-':
+            print(f'mtv: unknown option {a} (see mtv --help)', file=sys.stderr)
+            return 2
+        else:
+            rest.append(a)
+        k += 1
+    target = rest[0] if rest else 'README.md'
+    if target == '-':
+        text = sys.stdin.read()
+    else:
+        if os.path.isdir(target):
+            target = os.path.join(target, 'README.md')
+        try:
+            with open(target, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError as e:
+            print(f'mtv: {e.strerror}: {target}', file=sys.stderr)
+            return 1
+        C.basedir = os.path.dirname(os.path.abspath(target))
+    if force_tty and not sys.stdout.isatty():
+        # stdout redirigido (un tee, un wrapper…): dibujar en la terminal igualmente.
+        # Se cambia el fd 1 para que chafa, que lo hereda, también escriba ahí.
+        try:
+            fd = os.open('/dev/tty', os.O_WRONLY)
+            sys.stdout.flush()
+            os.dup2(fd, 1)
+            os.close(fd)
+        except OSError:
+            pass
+    setup(width_opt)
+
+    lines = text.expandtabs(4).replace('\r\n', '\n').split('\n')
+    if lines and lines[0].strip() == '---':       # front matter
+        for k in range(1, len(lines)):
+            if lines[k].strip() in ('---', '...'):
+                lines = lines[k + 1:]
+                break
+    body, fence = [], None
+    for line in lines:
+        m = FENCE_RE.match(line)
+        if m and (fence is None or line.strip().startswith(fence)):
+            fence = None if fence else m.group(2)[:3]
+        r = REF_RE.match(line) if fence is None else None
+        if r:
+            C.refs[r.group(1).lower()] = r.group(2)
+        else:
+            body.append(line)
+    emit(render(parse_blocks(body), C.width))
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.stdout = open(os.devnull, 'w')
+        sys.exit(130)
